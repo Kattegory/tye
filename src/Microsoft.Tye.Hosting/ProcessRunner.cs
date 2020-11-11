@@ -4,198 +4,129 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using Microsoft.DotNet.Watcher;
-using Microsoft.DotNet.Watcher.Internal;
-using Microsoft.Extensions.Logging;
 using Microsoft.Tye.Hosting.Model;
+using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 
 namespace Microsoft.Tye.Hosting
 {
     public class ProcessRunner : IApplicationProcessor
     {
-        private const string ProcessReplicaStore = "process";
-
         private readonly ILogger _logger;
         private readonly ProcessRunnerOptions _options;
-        private readonly ReplicaRegistry _replicaRegistry;
 
-        public ProcessRunner(ILogger logger, ReplicaRegistry replicaRegistry, ProcessRunnerOptions options)
+        public ProcessRunner(ILogger logger, ProcessRunnerOptions options)
         {
             _logger = logger;
-            _replicaRegistry = replicaRegistry;
             _options = options;
         }
 
-        public async Task StartAsync(Application application)
+        public Task StartAsync(Tye.Hosting.Model.Application application)
         {
-            await PurgeFromPreviousRun();
+            var tasks = new Task[application.Services.Count];
+            var index = 0;
+            foreach (var s in application.Services)
+            {
+                tasks[index++] = s.Value.ServiceType switch
+                {
+                    ServiceType.Container => Task.CompletedTask,
+                    ServiceType.External => Task.CompletedTask,
 
-            await BuildAndRunProjects(application);
+                    ServiceType.Executable => LaunchService(application, s.Value),
+                    ServiceType.Project => LaunchService(application, s.Value),
+
+                    _ => throw new InvalidOperationException("Unknown ServiceType."),
+                };
+            }
+
+            return Task.WhenAll(tasks);
         }
 
-        public Task StopAsync(Application application)
+        public Task StopAsync(Tye.Hosting.Model.Application application)
         {
             return KillRunningProcesses(application.Services);
         }
 
-        private async Task BuildAndRunProjects(Application application)
+        private async Task LaunchService(Tye.Hosting.Model.Application application, Tye.Hosting.Model.Service service)
         {
-            var projectGroups = new Dictionary<string, ProjectGroup>();
-            var groupCount = 0;
+            var serviceDescription = service.Description;
+            var serviceName = serviceDescription.Name;
 
-            foreach (var service in application.Services.Values)
+            var path = "";
+            var workingDirectory = "";
+            var args = "";
+
+            if (serviceDescription.RunInfo is ProjectRunInfo project)
             {
-                var serviceDescription = service.Description;
-
-                string path;
-                string args;
-                var buildProperties = string.Empty;
-                string workingDirectory;
-                if (serviceDescription.RunInfo is ProjectRunInfo project)
-                {
-                    path = project.RunCommand;
-                    workingDirectory = project.ProjectFile.Directory!.FullName;
-                    args = project.Args == null ? project.RunArguments : project.RunArguments + " " + project.Args;
-                    buildProperties = project.BuildProperties.Aggregate(string.Empty, (current, property) => current + $";{property.Key}={property.Value}").TrimStart(';');
-
-                    service.Status.ProjectFilePath = project.ProjectFile.FullName;
-                }
-                else if (serviceDescription.RunInfo is ExecutableRunInfo executable)
-                {
-                    path = executable.Executable;
-                    workingDirectory = executable.WorkingDirectory!;
-                    args = executable.Args ?? "";
-                }
-                else if (serviceDescription.RunInfo is AzureFunctionRunInfo function)
-                {
-                    path = function.FuncExecutablePath!;
-                    workingDirectory = new DirectoryInfo(function.FunctionPath).FullName;
-                    // todo make sure to exclude functions app from implied tye running.
-
-                    args = function.Args ?? $"start --build";
-                }
-                else
-                {
-                    continue;
-                }
-
-                // If this is a dll then use dotnet to run it
-                if (Path.GetExtension(path) == ".dll")
-                {
-                    args = $"\"{path}\" {args}".Trim();
-                    path = "dotnet";
-                }
-
-                service.Status.ExecutablePath = path;
-                service.Status.WorkingDirectory = workingDirectory;
-                service.Status.Args = args;
-
-                // TODO instead of always building with projects, try building with sln if available.
-                if (service.Status.ProjectFilePath != null &&
-                    service.Description.RunInfo is ProjectRunInfo project2 &&
-                    project2.Build &&
-                    _options.BuildProjects)
-                {
-                    if (!projectGroups.TryGetValue(buildProperties, out var projectGroup))
-                    {
-                        projectGroup = new ProjectGroup("ProjectGroup" + groupCount);
-                        projectGroups[buildProperties] = projectGroup;
-                        groupCount++;
-                    }
-
-                    projectGroup.Services.Add(service);
-                }
+                var expandedProject = Environment.ExpandEnvironmentVariables(project.Project);
+                var fullProjectPath = Path.GetFullPath(Path.Combine(application.ContextDirectory, expandedProject));
+                path = GetExePath(fullProjectPath);
+                workingDirectory = Path.GetDirectoryName(fullProjectPath)!;
+                args = project.Args ?? "";
+                service.Status.ProjectFilePath = fullProjectPath;
+            }
+            else if (serviceDescription.RunInfo is ExecutableRunInfo executable)
+            {
+                var expandedExecutable = Environment.ExpandEnvironmentVariables(executable.Executable);
+                path = Path.GetExtension(expandedExecutable) == ".dll" ?
+                    Path.GetFullPath(Path.Combine(application.ContextDirectory, expandedExecutable)) :
+                    expandedExecutable;
+                workingDirectory = executable.WorkingDirectory != null ?
+                    Path.GetFullPath(Path.Combine(application.ContextDirectory, Environment.ExpandEnvironmentVariables(executable.WorkingDirectory))) :
+                    Path.GetDirectoryName(path)!;
+                args = executable.Args ?? "";
+            }
+            else
+            {
+                throw new InvalidOperationException("Unsupported ServiceType.");
             }
 
-            if (projectGroups.Count > 0)
+            // If this is a dll then use dotnet to run it
+            if (Path.GetExtension(path) == ".dll")
             {
-                using var directory = TempDirectory.Create();
+                args = $"\"{path}\" {args}".Trim();
+                path = "dotnet";
+            }
 
-                var projectPath = Path.Combine(directory.DirectoryPath, Path.GetRandomFileName() + ".proj");
+            service.Status.ExecutablePath = path;
+            service.Status.WorkingDirectory = workingDirectory;
+            service.Status.Args = args;
 
-                var sb = new StringBuilder();
-                sb.AppendLine(@"<Project DefaultTargets=""Build"">");
+            var processInfo = new ProcessInfo(new Task[service.Description.Replicas]);
+            if (service.Status.ProjectFilePath != null &&
+                service.Description.RunInfo is ProjectRunInfo project2 &&
+                project2.Build &&
+                _options.BuildProjects)
+            {
+                // Sometimes building can fail because of file locking (like files being open in VS)
+                _logger.LogInformation("Building project {ProjectFile}", service.Status.ProjectFilePath);
 
-                foreach (var group in projectGroups)
-                {
-                    sb.AppendLine(@"    <ItemGroup>");
-                    foreach (var p in group.Value.Services)
-                    {
-                        sb.AppendLine($"        <{group.Value.GroupName} Include=\"{p.Status.ProjectFilePath}\" />");
-                    }
-                    sb.AppendLine(@"    </ItemGroup>");
-                }
+                service.Logs.OnNext($"dotnet build \"{service.Status.ProjectFilePath}\" /nologo");
 
-                sb.AppendLine($@"    <Target Name=""Build"">");
-                foreach (var group in projectGroups)
-                {
-                    sb.AppendLine($@"        <MsBuild Projects=""@({group.Value.GroupName})"" Properties=""{group.Key}"" BuildInParallel=""true"" />");
-                }
+                var buildResult = await ProcessUtil.RunAsync("dotnet", $"build \"{service.Status.ProjectFilePath}\" /nologo", throwOnError: false);
 
-                sb.AppendLine("    </Target>");
-                sb.AppendLine("</Project>");
-                File.WriteAllText(projectPath, sb.ToString());
-
-                _logger.LogInformation("Building projects");
-
-                var buildResult = await ProcessUtil.RunAsync("dotnet", $"build \"{projectPath}\" /nologo", throwOnError: false, workingDirectory: application.ContextDirectory);
+                service.Logs.OnNext(buildResult.StandardOutput);
 
                 if (buildResult.ExitCode != 0)
                 {
-                    throw new TyeBuildException($"Building projects failed with exit code {buildResult.ExitCode}: \r\n{buildResult.StandardOutput}");
+                    _logger.LogInformation("Building {ProjectFile} failed with exit code {ExitCode}: \r\n" + buildResult.StandardOutput, service.Status.ProjectFilePath, buildResult.ExitCode);
+                    return;
                 }
             }
 
-            foreach (var s in application.Services)
+            async Task RunApplicationAsync(IEnumerable<(int Port, int BindingPort, string? Protocol)> ports)
             {
-                switch (s.Value.ServiceType)
-                {
-                    case ServiceType.Executable:
-                        LaunchService(application, s.Value);
-                        break;
-                    case ServiceType.Project:
-                        LaunchService(application, s.Value);
-                        break;
-                    case ServiceType.Function:
-                        LaunchService(application, s.Value);
-                        break;
-                };
-            }
-        }
-
-        private void LaunchService(Application application, Service service)
-        {
-            var serviceDescription = service.Description;
-            var processInfo = new ProcessInfo(new Task[service.Description.Replicas]);
-            var serviceName = serviceDescription.Name;
-
-            // Set by BuildAndRunService
-            var args = service.Status.Args!;
-            var path = service.Status.ExecutablePath!;
-            var workingDirectory = service.Status.WorkingDirectory!;
-
-            async Task RunApplicationAsync(IEnumerable<(int ExternalPort, int Port, string? Protocol)> ports, string copiedArgs)
-            {
-                // Make sure we yield before trying to start the process, this is important so we don't block startup
-                await Task.Yield();
-
                 var hasPorts = ports.Any();
 
                 var environment = new Dictionary<string, string>
                 {
                     // Default to development environment
-                    ["DOTNET_ENVIRONMENT"] = "Development",
-                    ["ASPNETCORE_ENVIRONMENT"] = "Development",
-                    // Remove the color codes from the console output
-                    ["DOTNET_LOGGING__CONSOLE__DISABLECOLORS"] = "true",
-                    ["ASPNETCORE_LOGGING__CONSOLE__DISABLECOLORS"] = "true"
+                    ["DOTNET_ENVIRONMENT"] = "Development"
                 };
 
                 // Set up environment variables to use the version of dotnet we're using to run
@@ -210,64 +141,29 @@ namespace Microsoft.Tye.Hosting
 
                 application.PopulateEnvironment(service, (k, v) => environment[k] = v);
 
-                if (_options.DebugMode && (_options.DebugAllServices || _options.ServicesToDebug!.Contains(serviceName, StringComparer.OrdinalIgnoreCase)))
+                if (_options.DebugMode && (_options.DebugAllServices || _options.ServicesToDebug.Contains(serviceName, StringComparer.OrdinalIgnoreCase)))
                 {
                     environment["DOTNET_STARTUP_HOOKS"] = typeof(Hosting.Runtime.HostingRuntimeHelpers).Assembly.Location;
                 }
 
                 if (hasPorts)
                 {
-                    // We need to bind to all interfaces on linux since the container -> host communication won't work
-                    // if we use the IP address to reach out of the host. This works fine on osx and windows
-                    // but doesn't work on linux.
-                    var host = RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "*" : "localhost";
+                    // These ports should also be passed in not assuming ASP.NET Core
+                    environment["ASPNETCORE_URLS"] = string.Join(";", ports.Select(p => $"{p.Protocol ?? "http"}://localhost:{p.Port}"));
 
-                    // These are the ports that the application should use for binding
-
-                    // 1. Configure ASP.NET Core to bind to those same ports
-                    environment["ASPNETCORE_URLS"] = string.Join(";", ports.Select(p => $"{p.Protocol ?? "http"}://{host}:{p.Port}"));
-
-                    // Set the HTTPS port for the redirect middleware
                     foreach (var p in ports)
                     {
-                        if (string.Equals(p.Protocol, "https", StringComparison.OrdinalIgnoreCase))
-                        {
-                            // We need to set the redirect URL to the exposed port so the redirect works cleanly
-                            environment["HTTPS_PORT"] = p.ExternalPort.ToString();
-                        }
-                    }
-
-                    // 3. For non-ASP.NET Core apps, pass the same information in the PORT env variable as a semicolon separated list.
-                    environment["PORT"] = string.Join(";", ports.Select(p => $"{p.Port}"));
-
-                    if (service.ServiceType == ServiceType.Function)
-                    {
-                        // Need to inject port and UseHttps as an argument to func.exe rather than environment variables.
-                        var binding = ports.First();
-                        copiedArgs += $" --port {binding.Port}";
-                        if (binding.Protocol == "https")
-                        {
-                            copiedArgs += " --useHttps";
-                        }
+                        environment[$"{p.Protocol?.ToUpper() ?? "HTTP"}_PORT"] = p.BindingPort.ToString();
                     }
                 }
-
-                var backOff = TimeSpan.FromSeconds(5);
 
                 while (!processInfo.StoppedTokenSource.IsCancellationRequested)
                 {
                     var replica = serviceName + "_" + Guid.NewGuid().ToString().Substring(0, 10).ToLower();
                     var status = new ProcessStatus(service, replica);
+                    service.Replicas[replica] = status;
 
-                    using var stoppingCts = new CancellationTokenSource();
-                    status.StoppingTokenSource = stoppingCts;
-                    await using var _ = processInfo.StoppedTokenSource.Token.Register(() => status.StoppingTokenSource.Cancel());
-
-                    if (!_options.Watch)
-                    {
-                        service.Replicas[replica] = status;
-                        service.ReplicaEvents.OnNext(new ReplicaEvent(ReplicaState.Added, status));
-                    }
+                    service.ReplicaEvents.OnNext(new ReplicaEvent(ReplicaState.Added, status));
 
                     // This isn't your host name
                     environment["APP_INSTANCE"] = replica;
@@ -279,32 +175,19 @@ namespace Microsoft.Tye.Hosting
                     if (hasPorts)
                     {
                         status.Ports = ports.Select(p => p.Port);
-                        status.Bindings = ports.Select(p => new ReplicaBinding() { Port = p.Port, ExternalPort = p.ExternalPort, Protocol = p.Protocol }).ToList();
                     }
 
-                    // TODO clean this up.
-                    foreach (var env in environment)
-                    {
-                        copiedArgs = copiedArgs.Replace($"%{env.Key}%", env.Value);
-                    }
-
-                    _logger.LogInformation("Launching service {ServiceName}: {ExePath} {args}", replica, path, copiedArgs);
+                    _logger.LogInformation("Launching service {ServiceName}: {ExePath} {args}", replica, path, args);
 
                     try
                     {
-                        service.Logs.OnNext($"[{replica}]:{path} {copiedArgs}");
-                        var processInfo = new ProcessSpec
-                        {
-                            Executable = path,
-                            WorkingDirectory = workingDirectory,
-                            Arguments = copiedArgs,
-                            EnvironmentVariables = environment,
-                            OutputData = data =>
-                            {
-                                service.Logs.OnNext($"[{replica}]: {data}");
-                            },
-                            ErrorData = data => service.Logs.OnNext($"[{replica}]: {data}"),
-                            OnStart = pid =>
+                        service.Logs.OnNext($"[{replica}]:{path} {args}");
+
+                        var result = await ProcessUtil.RunAsync(path, args,
+                            environmentVariables: environment,
+                            workingDirectory: workingDirectory,
+                            outputDataReceived: data => service.Logs.OnNext($"[{replica}]: {data}"),
+                            onStart: pid =>
                             {
                                 if (hasPorts)
                                 {
@@ -315,115 +198,37 @@ namespace Microsoft.Tye.Hosting
                                     _logger.LogInformation("{ServiceName} running on process id {PID}", replica, pid);
                                 }
 
-                                // Reset the backoff
-                                backOff = TimeSpan.FromSeconds(5);
-
                                 status.Pid = pid;
-
-                                WriteReplicaToStore(pid.ToString());
-
-                                if (_options.Watch)
-                                {
-                                    // OnStart/OnStop will be called multiple times for watch.
-                                    // Watch will constantly be adding and removing from the list, so only add here for watch.
-                                    service.Replicas[replica] = status;
-                                    service.ReplicaEvents.OnNext(new ReplicaEvent(ReplicaState.Added, status));
-                                }
 
                                 service.ReplicaEvents.OnNext(new ReplicaEvent(ReplicaState.Started, status));
                             },
-                            OnStop = exitCode =>
-                            {
-                                status.ExitCode = exitCode;
+                            throwOnError: false,
+                            cancellationToken: processInfo.StoppedTokenSource.Token);
 
-                                if (status.Pid != null)
-                                {
-                                    service.ReplicaEvents.OnNext(new ReplicaEvent(ReplicaState.Stopped, status));
-                                }
+                        status.ExitCode = result.ExitCode;
 
-                                if (!_options.Watch)
-                                {
-                                    // Only increase backoff when not watching project as watch will wait for file changes before rebuild.
-                                    backOff *= 2;
-                                }
-
-                                service.Restarts++;
-
-                                service.Replicas.TryRemove(replica, out var _);
-                                service.ReplicaEvents.OnNext(new ReplicaEvent(ReplicaState.Removed, status));
-
-                                if (status.ExitCode != null)
-                                {
-                                    _logger.LogInformation("{ServiceName} process exited with exit code {ExitCode}", replica, status.ExitCode);
-                                }
-                            },
-                            Build = async () =>
-                            {
-                                if (service.Description.RunInfo is ProjectRunInfo)
-                                {
-                                    var buildResult = await ProcessUtil.RunAsync("dotnet", $"build \"{service.Status.ProjectFilePath}\" /nologo", throwOnError: false, workingDirectory: application.ContextDirectory);
-                                    if (buildResult.ExitCode != 0)
-                                    {
-                                        _logger.LogInformation("Building projects failed with exit code {ExitCode}: \r\n" + buildResult.StandardOutput, buildResult.ExitCode);
-                                    }
-                                    return buildResult.ExitCode;
-                                }
-
-                                return 0;
-                            }
-                        };
-
-                        if (_options.Watch && (service.Description.RunInfo is ProjectRunInfo runInfo))
+                        if (status.Pid != null)
                         {
-                            var projectFile = runInfo.ProjectFile.FullName;
-                            var fileSetFactory = new MsBuildFileSetFactory(_logger,
-                                projectFile,
-                                waitOnError: true,
-                                trace: false);
-                            environment["DOTNET_WATCH"] = "1";
-
-                            await new DotNetWatcher(_logger)
-                                .WatchAsync(processInfo, fileSetFactory, replica, status.StoppingTokenSource.Token);
-                        }
-                        else if (_options.Watch && (service.Description.RunInfo is AzureFunctionRunInfo azureFunctionRunInfo) && !string.IsNullOrEmpty(azureFunctionRunInfo.ProjectFile))
-                        {
-                            var projectFile = azureFunctionRunInfo.ProjectFile;
-                            var fileSetFactory = new MsBuildFileSetFactory(_logger,
-                                projectFile,
-                                waitOnError: true,
-                                trace: false);
-                            environment["DOTNET_WATCH"] = "1";
-
-                            await new DotNetWatcher(_logger)
-                                .WatchAsync(processInfo, fileSetFactory, replica, status.StoppingTokenSource.Token);
-                        }
-                        else
-                        {
-                            await ProcessUtil.RunAsync(processInfo, status.StoppingTokenSource.Token, throwOnError: false);
+                            service.ReplicaEvents.OnNext(new ReplicaEvent(ReplicaState.Stopped, status));
                         }
                     }
                     catch (Exception ex)
                     {
                         _logger.LogError(0, ex, "Failed to launch process for service {ServiceName}", replica);
 
-                        if (!_options.Watch)
-                        {
-                            // Only increase backoff when not watching project as watch will wait for file changes before rebuild.
-                            backOff *= 2;
-                        }
-
-                        service.Restarts++;
-                        service.Replicas.TryRemove(replica, out var _);
-
-                        try
-                        {
-                            await Task.Delay(backOff, processInfo.StoppedTokenSource.Token);
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            // Swallow cancellation exceptions and continue
-                        }
+                        Thread.Sleep(5000);
                     }
+
+                    service.Restarts++;
+
+                    if (status.ExitCode != null)
+                    {
+                        _logger.LogInformation("{ServiceName} process exited with exit code {ExitCode}", replica, status.ExitCode);
+                    }
+
+                    // Remove the replica from the set
+                    service.Replicas.TryRemove(replica, out _);
+                    service.ReplicaEvents.OnNext(new ReplicaEvent(ReplicaState.Removed, status));
                 }
             }
 
@@ -441,35 +246,34 @@ namespace Microsoft.Tye.Hosting
                             continue;
                         }
 
-                        ports.Add((binding.Port.Value, binding.ReplicaPorts[i], binding.Protocol));
+                        ports.Add((service.PortMap[binding.Port.Value][i], binding.Port.Value, binding.Protocol));
                     }
 
-                    processInfo.Tasks[i] = RunApplicationAsync(ports, args);
+                    processInfo.Tasks[i] = RunApplicationAsync(ports);
                 }
             }
             else
             {
                 for (int i = 0; i < service.Description.Replicas; i++)
                 {
-                    processInfo.Tasks[i] = RunApplicationAsync(Enumerable.Empty<(int, int, string?)>(), args);
+                    processInfo.Tasks[i] = RunApplicationAsync(Enumerable.Empty<(int, int, string?)>());
                 }
             }
 
             service.Items[typeof(ProcessInfo)] = processInfo;
         }
 
-        private Task KillRunningProcesses(IDictionary<string, Service> services)
+        private Task KillRunningProcesses(IDictionary<string, Tye.Hosting.Model.Service> services)
         {
-            static Task KillProcessAsync(Service service)
+            static async Task KillProcessAsync(Tye.Hosting.Model.Service service)
             {
                 if (service.Items.TryGetValue(typeof(ProcessInfo), out var stateObj) && stateObj is ProcessInfo state)
                 {
                     // Cancel the token before stopping the process
                     state.StoppedTokenSource.Cancel();
 
-                    return Task.WhenAll(state.Tasks);
+                    await Task.WhenAll(state.Tasks);
                 }
-                return Task.CompletedTask;
             }
 
             var index = 0;
@@ -483,33 +287,36 @@ namespace Microsoft.Tye.Hosting
             return Task.WhenAll(tasks);
         }
 
-        private async Task PurgeFromPreviousRun()
+        private static string GetExePath(string projectFilePath)
         {
-            var processReplicas = await _replicaRegistry.GetEvents(ProcessReplicaStore);
-            foreach (var replica in processReplicas)
+            // TODO: Use msbuild to get the target path
+
+            var outputFileName = Path.GetFileNameWithoutExtension(projectFilePath) + (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? ".exe" : ".dll");
+
+            var debugOutputPath = Path.Combine(Path.GetDirectoryName(projectFilePath)!, "bin", "Debug");
+
+            var tfms = Directory.Exists(debugOutputPath) ? Directory.GetDirectories(debugOutputPath) : Array.Empty<string>();
+
+            if (tfms.Length > 0)
             {
-                if (int.TryParse(replica["pid"], out var pid))
+                // Pick the first one
+                var path = Path.Combine(debugOutputPath, tfms[0], outputFileName);
+                if (File.Exists(path))
                 {
-                    ProcessUtil.KillProcess(pid);
-                    _logger.LogInformation("removed process {pid} from previous run", pid);
+                    return path;
                 }
+
+                // Older versions of .NET Core didn't have TFMs
+                return Path.Combine(debugOutputPath, tfms[0], Path.GetFileNameWithoutExtension(projectFilePath) + ".dll");
             }
 
-            _replicaRegistry.DeleteStore(ProcessReplicaStore);
-        }
-
-        private void WriteReplicaToStore(string pid)
-        {
-            _replicaRegistry.WriteReplicaEvent(ProcessReplicaStore, new Dictionary<string, string>()
-            {
-                ["pid"] = pid
-            });
+            return Path.Combine(debugOutputPath, "netcoreapp3.1", outputFileName);
         }
 
         private static string? GetDotnetRoot()
         {
-            var entryPointFilePath = GetEntryPointFilePath();
-
+            var process = Process.GetCurrentProcess();
+            var entryPointFilePath = process.MainModule.FileName;
             if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows) &&
                 Path.GetFileNameWithoutExtension(entryPointFilePath) == "dotnet")
             {
@@ -523,12 +330,6 @@ namespace Microsoft.Tye.Hosting
             return null;
         }
 
-        private static string GetEntryPointFilePath()
-        {
-            using var process = Process.GetCurrentProcess();
-            return process.MainModule!.FileName!;
-        }
-
         private class ProcessInfo
         {
 
@@ -540,16 +341,6 @@ namespace Microsoft.Tye.Hosting
             public Task[] Tasks { get; }
 
             public CancellationTokenSource StoppedTokenSource { get; } = new CancellationTokenSource();
-        }
-
-        private class ProjectGroup
-        {
-            public ProjectGroup(string groupName)
-            {
-                GroupName = groupName;
-            }
-            public List<Service> Services { get; } = new List<Service>();
-            public string GroupName { get; }
         }
     }
 }

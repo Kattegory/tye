@@ -4,20 +4,18 @@
 
 using System;
 using System.Collections.Generic;
-using System.Diagnostics;
 using System.Globalization;
 using System.Linq;
 using System.Net;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.FileProviders;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
 using Microsoft.Tye.Hosting.Diagnostics;
-using Microsoft.Tye.Hosting.Model;
 using Serilog;
 using Serilog.Core;
 using Serilog.Events;
@@ -25,7 +23,7 @@ using Serilog.Filters;
 
 namespace Microsoft.Tye.Hosting
 {
-    public class TyeHost : IAsyncDisposable
+    public class TyeHost : IDisposable
     {
         private const int DefaultPort = 8000;
         private const int AutodetectPort = 0;
@@ -34,17 +32,23 @@ namespace Microsoft.Tye.Hosting
         private IHostApplicationLifetime? _lifetime;
         private AggregateApplicationProcessor? _processor;
 
-        private readonly Application _application;
-        private readonly HostOptions _options;
-        private ReplicaRegistry? _replicaRegistry;
+        private readonly Tye.Hosting.Model.Application _application;
+        private readonly string[] _args;
+        private readonly string[] _servicesToDebug;
 
-        public TyeHost(Application application, HostOptions options)
+        public TyeHost(Tye.Hosting.Model.Application application, string[] args)
+            : this(application, args, new string[0])
         {
-            _application = application;
-            _options = options;
         }
 
-        public Application Application => _application;
+        public TyeHost(Tye.Hosting.Model.Application application, string[] args, string[] servicesToDebug)
+        {
+            _application = application;
+            _args = args;
+            _servicesToDebug = servicesToDebug;
+        }
+
+        public Tye.Hosting.Model.Application Application => _application;
 
         public WebApplication? DashboardWebApplication { get; set; }
 
@@ -53,27 +57,18 @@ namespace Microsoft.Tye.Hosting
 
         public async Task RunAsync()
         {
-            try
-            {
-                await StartAsync();
+            await StartAsync();
 
-                var waitForStop = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
-                _lifetime?.ApplicationStopping.Register(obj =>
-                {
-                    _logger?.LogInformation("Tye Host is stopping...");
-                    waitForStop.TrySetResult(null);
-                }, null);
-                await waitForStop.Task;
-            }
-            finally
-            {
-                await StopAsync();
-            }
+            var waitForStop = new TaskCompletionSource<object?>(TaskCreationOptions.RunContinuationsAsynchronously);
+            _lifetime?.ApplicationStopping.Register(obj => waitForStop.TrySetResult(null), null);
+            await waitForStop.Task;
+
+            await StopAsync();
         }
 
         public async Task<WebApplication> StartAsync()
         {
-            var app = BuildWebApplication(_application, _options, Sink);
+            var app = BuildWebApplication(_application, _args, Sink);
             DashboardWebApplication = app;
 
             _logger = app.Logger;
@@ -83,9 +78,9 @@ namespace Microsoft.Tye.Hosting
 
             ConfigureApplication(app);
 
-            _replicaRegistry = new ReplicaRegistry(_application.ContextDirectory, _logger);
+            var configuration = app.Configuration;
 
-            _processor = CreateApplicationProcessor(_replicaRegistry, _options, _logger);
+            _processor = CreateApplicationProcessor(_args, _servicesToDebug, _logger, configuration);
 
             await app.StartAsync();
 
@@ -95,44 +90,45 @@ namespace Microsoft.Tye.Hosting
             {
                 await _processor.StartAsync(_application);
             }
-            catch (TyeBuildException ex)
+            catch (Exception ex)
             {
-                _logger.LogError(ex.Message);
-                _lifetime.StopApplication();
-            }
-
-            if (_options.Dashboard)
-            {
-                OpenDashboard(app.Addresses.First());
+                _logger.LogError(0, ex, "Failed to launch application");
             }
 
             return app;
         }
 
-        private static WebApplication BuildWebApplication(Application application, HostOptions options, ILogEventSink? sink)
+        public async Task StopAsync()
         {
-            var args = new List<string>();
-            if (options.Port.HasValue)
+            try
             {
-                args.Add("--port");
-                args.Add(options.Port.Value.ToString(CultureInfo.InvariantCulture));
+                if (_processor != null)
+                {
+                    await _processor.StopAsync(_application);
+                }
             }
+            finally
+            {
+                if (DashboardWebApplication != null)
+                {
+                    // Stop the host after everything else has been shutdown
+                    await DashboardWebApplication.StopAsync();
+                }
+            }
+        }
 
-            var builder = WebApplication.CreateBuilder(args.ToArray());
+        private static WebApplication BuildWebApplication(
+            Tye.Hosting.Model.Application application,
+            string[] args,
+            ILogEventSink? sink)
+        {
+            var builder = WebApplication.CreateBuilder(args);
 
             // Logging for this application
             builder.Host.UseSerilog((context, configuration) =>
             {
-                var logLevel = options.LogVerbosity switch
-                {
-                    Verbosity.Quiet => LogEventLevel.Warning,
-                    Verbosity.Info => LogEventLevel.Information,
-                    Verbosity.Debug => LogEventLevel.Verbose,
-                    _ => default
-                };
-
                 configuration
-                    .MinimumLevel.Is(logLevel)
+                    .MinimumLevel.Verbose()
                     .Filter.ByExcluding(Matching.FromSource("Microsoft.AspNetCore"))
                     .Filter.ByExcluding(Matching.FromSource("Microsoft.Extensions"))
                     .Filter.ByExcluding(Matching.FromSource("Microsoft.Hosting"))
@@ -143,7 +139,7 @@ namespace Microsoft.Tye.Hosting
 
                 if (sink is object)
                 {
-                    configuration.WriteTo.Sink(sink, logLevel);
+                    configuration.WriteTo.Sink(sink, LogEventLevel.Verbose);
                 }
             });
 
@@ -160,20 +156,6 @@ namespace Microsoft.Tye.Hosting
                     o.FileProvider = new CompositeFileProvider(o.FileProvider, fileProvider);
                 });
 
-            builder.Services.AddCors(
-                options =>
-                {
-                    options.AddPolicy(
-                        "default",
-                        policy =>
-                        {
-                            policy
-                                .AllowAnyOrigin()
-                                .AllowAnyHeader()
-                                .AllowAnyMethod();
-                        });
-                });
-
             builder.Services.AddSingleton(application);
             var app = builder.Build();
             return app;
@@ -186,8 +168,6 @@ namespace Microsoft.Tye.Hosting
             app.Listen($"http://127.0.0.1:{port}");
 
             app.UseDeveloperExceptionPage();
-
-            app.UseCors("default");
 
             app.UseStaticFiles();
 
@@ -219,13 +199,13 @@ namespace Microsoft.Tye.Hosting
             else if (IsPortInUseByBinding(_application, DefaultPort))
             {
                 // Port has been reserved for the app.
-                app.Logger.LogInformation("Default dashboard port {DefaultPort} has been reserved by the application, choosing random port.", DefaultPort);
+                app.Logger.LogInformation($"Default dashboard port {DefaultPort} has been reserved by the application, choosing random port.");
                 return AutodetectPort;
             }
             else if (IsPortAlreadyInUse(DefaultPort))
             {
                 // Port is in use by something already running.
-                app.Logger.LogInformation("Default dashboard port {DefaultPort} is in use, choosing random port.", DefaultPort);
+                app.Logger.LogInformation($"Default dashboard port {DefaultPort} is in use, choosing random port.");
                 return AutodetectPort;
             }
             else
@@ -249,7 +229,7 @@ namespace Microsoft.Tye.Hosting
             }
         }
 
-        private static bool IsPortInUseByBinding(Application application, int port)
+        private static bool IsPortInUseByBinding(Model.Application application, int port)
         {
             foreach (var service in application.Services)
             {
@@ -265,44 +245,24 @@ namespace Microsoft.Tye.Hosting
             return false;
         }
 
-        private static AggregateApplicationProcessor CreateApplicationProcessor(ReplicaRegistry replicaRegistry, HostOptions options, Microsoft.Extensions.Logging.ILogger logger)
+        private static AggregateApplicationProcessor CreateApplicationProcessor(string[] args, string[] _servicesToDebug, Microsoft.Extensions.Logging.ILogger logger, IConfiguration configuration)
         {
-            var diagnosticsCollector = new DiagnosticsCollector(logger)
-            {
-                // Local run always uses metrics for the dashboard
-                MetricSink = new MetricSink(logger),
-            };
-
-            if (options.LoggingProvider is string &&
-                DiagnosticsProvider.TryParse(options.LoggingProvider, out var logging))
-            {
-                diagnosticsCollector.LoggingSink = new LoggingSink(logger, logging);
-            }
-
-            if (options.DistributedTraceProvider is string &&
-                DiagnosticsProvider.TryParse(options.DistributedTraceProvider, out var tracing))
-            {
-                diagnosticsCollector.TracingSink = new TracingSink(logger, tracing);
-            }
+            var diagnosticOptions = DiagnosticOptions.FromConfiguration(configuration);
+            var diagnosticsCollector = new DiagnosticsCollector(logger, diagnosticOptions);
 
             // Print out what providers were selected and their values
-            DumpDiagnostics(options, logger);
+            diagnosticOptions.DumpDiagnostics(logger);
 
             var processors = new List<IApplicationProcessor>
             {
                 new EventPipeDiagnosticsRunner(logger, diagnosticsCollector),
-                new PortAssigner(logger),
                 new ProxyService(logger),
-                new HttpProxyService(logger),
-                new DockerImagePuller(logger),
-                new FuncFinder(logger),
-                new ReplicaMonitor(logger),
-                new DockerRunner(logger, replicaRegistry),
-                new ProcessRunner(logger, replicaRegistry, ProcessRunnerOptions.FromHostOptions(options))
+                new DockerRunner(logger),
+                new ProcessRunner(logger, ProcessRunnerOptions.FromArgs(args, _servicesToDebug)),
             };
 
-            // If the docker command is specified then transform the ProjectRunInfo into DockerRunInfo
-            if (options.Docker)
+            // If the docker command is specified then transport the ProjectRunInfo into DockerRunInfo
+            if (args.Contains("--docker"))
             {
                 processors.Insert(0, new TransformProjectsIntoContainers(logger));
             }
@@ -310,90 +270,9 @@ namespace Microsoft.Tye.Hosting
             return new AggregateApplicationProcessor(processors);
         }
 
-        private async Task StopAsync()
+        public void Dispose()
         {
-            try
-            {
-                if (_processor != null)
-                {
-                    await _processor.StopAsync(_application);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error while shutting down");
-            }
-            finally
-            {
-                if (DashboardWebApplication != null)
-                {
-                    // Stop the host after everything else has been shutdown
-                    await DashboardWebApplication.StopAsync();
-                }
-            }
-
-            _processor = null;
-        }
-
-        private void OpenDashboard(string url)
-        {
-            try
-            {
-                // https://github.com/dotnet/corefx/issues/10361
-                if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-                {
-                    url = url.Replace("&", "^&");
-                    System.Diagnostics.Process.Start(new ProcessStartInfo("cmd", $"/c start {url}") { CreateNoWindow = true });
-                }
-                else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
-                {
-                    System.Diagnostics.Process.Start("xdg-open", url);
-                }
-                else if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX))
-                {
-                    System.Diagnostics.Process.Start("open", url);
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error launching dashboard.");
-            }
-        }
-
-        public async ValueTask DisposeAsync()
-        {
-            await StopAsync();
-
-            _replicaRegistry?.Dispose();
             DashboardWebApplication?.Dispose();
-        }
-
-        private static void DumpDiagnostics(HostOptions options, Microsoft.Extensions.Logging.ILogger logger)
-        {
-            var providerText = new List<string>();
-            providerText.AddRange(
-                new[] { options.DistributedTraceProvider, options.LoggingProvider, options.MetricsProvider }
-                .Where(p => p is object)
-                .Cast<string>()!);
-
-            foreach (var text in providerText)
-            {
-                if (DiagnosticsProvider.TryParse(text, out var provider))
-                {
-                    if (DiagnosticsProvider.WellKnownProviders.TryGetValue(provider.Key, out var wellKnown))
-                    {
-                        logger.LogInformation(wellKnown.LogFormat, provider.Value);
-                    }
-                    else
-                    {
-                        logger.LogWarning("Unknown diagnostics provider {Key}:{Value}", provider.Key, provider.Value);
-                    }
-                }
-                else
-                {
-                    logger.LogError("Could not parse provider argument: {Arg}", text);
-                }
-            }
         }
     }
 }
